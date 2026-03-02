@@ -1,0 +1,753 @@
+// ============================================================
+//  SOLARPORT — Cloud App with Microsoft SSO + Supabase
+//  Admin: john.sadlier@dcsi.ie
+// ============================================================
+//
+//  SETUP: Replace these 3 placeholders before deploying:
+//
+//  1. AZURE_CLIENT_ID   — from Azure AD App Registration
+//  2. SUPABASE_URL      — from your Supabase project settings
+//  3. SUPABASE_ANON_KEY — from your Supabase project settings
+//
+// ============================================================
+
+import { useState, useEffect, useCallback } from "react";
+
+// ─── CONFIG ──────────────────────────────────────────────────────────────────
+const CONFIG = {
+  ADMIN_EMAIL: "john.sadlier@dcsi.ie",
+  AZURE_CLIENT_ID: "YOUR_AZURE_CLIENT_ID",          // ← Replace after Azure setup
+  AZURE_TENANT_ID: "YOUR_AZURE_TENANT_ID",          // ← Replace after Azure setup
+  SUPABASE_URL: "YOUR_SUPABASE_URL",                // ← Replace after Supabase setup
+  SUPABASE_ANON_KEY: "YOUR_SUPABASE_ANON_KEY",      // ← Replace after Supabase setup
+};
+
+// ─── SUPABASE CLIENT ──────────────────────────────────────────────────────────
+const supabase = (() => {
+  const headers = {
+    "Content-Type": "application/json",
+    "apikey": CONFIG.SUPABASE_ANON_KEY,
+    "Authorization": `Bearer ${CONFIG.SUPABASE_ANON_KEY}`,
+  };
+  const base = CONFIG.SUPABASE_URL + "/rest/v1";
+
+  return {
+    async get(table) {
+      const r = await fetch(`${base}/${table}?order=id`, { headers });
+      if (!r.ok) throw new Error(await r.text());
+      return r.json();
+    },
+    async upsert(table, data) {
+      const r = await fetch(`${base}/${table}`, {
+        method: "POST",
+        headers: { ...headers, "Prefer": "resolution=merge-duplicates" },
+        body: JSON.stringify(data),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      return r.json();
+    },
+    async delete(table, id) {
+      const r = await fetch(`${base}/${table}?id=eq.${id}`, { method: "DELETE", headers });
+      if (!r.ok) throw new Error(await r.text());
+    },
+    async getConfig(key) {
+      const r = await fetch(`${base}/app_config?key=eq.${key}`, { headers });
+      const rows = await r.json();
+      return rows[0]?.value ? JSON.parse(rows[0].value) : null;
+    },
+    async setConfig(key, value) {
+      const r = await fetch(`${base}/app_config`, {
+        method: "POST",
+        headers: { ...headers, "Prefer": "resolution=merge-duplicates" },
+        body: JSON.stringify({ key, value: JSON.stringify(value) }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+    },
+  };
+})();
+
+// ─── MICROSOFT AUTH ───────────────────────────────────────────────────────────
+const msAuth = {
+  getLoginUrl() {
+    const params = new URLSearchParams({
+      client_id: CONFIG.AZURE_CLIENT_ID,
+      response_type: "token",
+      redirect_uri: window.location.origin,
+      scope: "openid profile email User.Read",
+      response_mode: "fragment",
+    });
+    return `https://login.microsoftonline.com/${CONFIG.AZURE_TENANT_ID}/oauth2/v2.0/authorize?${params}`;
+  },
+
+  parseTokenFromHash() {
+    const hash = window.location.hash.substring(1);
+    const params = new URLSearchParams(hash);
+    return params.get("access_token") || null;
+  },
+
+  async getUserInfo(token) {
+    const r = await fetch("https://graph.microsoft.com/v1.0/me", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!r.ok) throw new Error("Failed to get user info");
+    return r.json();
+  },
+
+  clearHash() {
+    history.replaceState(null, "", window.location.pathname);
+  },
+};
+
+// ─── DEFAULT DATA ─────────────────────────────────────────────────────────────
+const DEFAULTS = {
+  prices: [
+    { id: 1, name: "Solarport Basic", sku: "SP-100", price: 4999, unit: "per unit", category: "Hardware" },
+    { id: 2, name: "Solarport Pro", sku: "SP-200", price: 8499, unit: "per unit", category: "Hardware" },
+    { id: 3, name: "Installation Standard", sku: "INST-S", price: 1200, unit: "per job", category: "Service" },
+    { id: 4, name: "Installation Premium", sku: "INST-P", price: 2100, unit: "per job", category: "Service" },
+    { id: 5, name: "Annual Maintenance", sku: "MAINT-Y", price: 350, unit: "per year", category: "Service" },
+  ],
+  customers: [
+    { id: 1, name: "Brennan Renewables Ltd", email: "info@brennan.ie", phone: "01 234 5678", tier: "Premium", notes: "Long-term client" },
+    { id: 2, name: "O'Brien Construction", email: "contact@obrien.ie", phone: "087 123 4567", tier: "Standard", notes: "" },
+  ],
+  configurator: {
+    panelOptions: ["180W Mono", "250W Poly", "300W Mono PERC", "400W Bifacial"],
+    batteryOptions: ["5kWh LiFePO4", "10kWh LiFePO4", "20kWh LiFePO4", "Custom"],
+    chargerTypes: ["Type 2 AC (7kW)", "Type 2 AC (22kW)", "CCS DC (50kW)", "CCS DC (150kW)"],
+    roofTypes: ["Flat Roof", "Pitched Roof", "Canopy/Carport", "Ground Mount"],
+    warrantyYears: ["5 Years", "10 Years", "15 Years", "25 Years"],
+    maxPanelsPerPort: 16,
+    defaultMargin: 22,
+  },
+  settings: {
+    vatRate: 13.5,
+    currency: "EUR",
+    defaultMargin: 22,
+    companyName: "DCSI Solarport",
+    quoteValidDays: 30,
+    footerNote: "All prices subject to site survey.",
+  },
+};
+
+// ─── ICONS ───────────────────────────────────────────────────────────────────
+const Icon = ({ name, size = 16 }) => {
+  const d = {
+    sun: "M12 3v1m0 16v1M4.22 4.22l.7.7m12.16 12.16l.7.7M3 12h1m16 0h1M4.92 19.08l.7-.7M18.36 5.64l.7-.7M12 7a5 5 0 1 0 0 10A5 5 0 0 0 12 7z",
+    lock: null,
+    price: null,
+    users: null,
+    solar: "M12 3v1m0 16v1M4.22 4.22l.7.7m12.16 12.16l.7.7M3 12h1m16 0h1M4.92 19.08l.7-.7M18.36 5.64l.7-.7",
+    settings: null,
+    plus: "M12 5v14M5 12h14",
+    trash: "M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6",
+    edit: "M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4z",
+    save: "M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2zM17 21v-8H7v8M7 3v5h8",
+    logout: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9",
+    shield: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z",
+    check: "M20 6L9 17l-5-5",
+    ms: null,
+  };
+
+  const svgIcons = {
+    lock: <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>,
+    price: <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>,
+    users: <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>,
+    settings: <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>,
+    ms: (
+      <svg width={size} height={size} viewBox="0 0 21 21">
+        <rect x="1" y="1" width="9" height="9" fill="#f25022"/>
+        <rect x="11" y="1" width="9" height="9" fill="#7fba00"/>
+        <rect x="1" y="11" width="9" height="9" fill="#00a4ef"/>
+        <rect x="11" y="11" width="9" height="9" fill="#ffb900"/>
+      </svg>
+    ),
+  };
+
+  if (svgIcons[name]) return svgIcons[name];
+  if (d[name]) return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d={d[name]}/>
+    </svg>
+  );
+  return null;
+};
+
+// ─── AUTH GATE — Microsoft Login ──────────────────────────────────────────────
+function LoginScreen({ onLogin }) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    const token = msAuth.parseTokenFromHash();
+    if (token) {
+      setLoading(true);
+      msAuth.getUserInfo(token)
+        .then(user => {
+          msAuth.clearHash();
+          const email = user.mail || user.userPrincipalName;
+          if (!email.endsWith("@dcsi.ie")) {
+            setError("Access restricted to dcsi.ie accounts only.");
+            setLoading(false);
+            return;
+          }
+          sessionStorage.setItem("sp_token", token);
+          sessionStorage.setItem("sp_user", JSON.stringify({
+            name: user.displayName,
+            email,
+            isAdmin: email.toLowerCase() === CONFIG.ADMIN_EMAIL.toLowerCase(),
+          }));
+          onLogin({ name: user.displayName, email, isAdmin: email.toLowerCase() === CONFIG.ADMIN_EMAIL.toLowerCase() });
+        })
+        .catch(() => {
+          setError("Authentication failed. Please try again.");
+          setLoading(false);
+        });
+    }
+  }, []);
+
+  // Check existing session
+  useEffect(() => {
+    const stored = sessionStorage.getItem("sp_user");
+    const token = sessionStorage.getItem("sp_token");
+    if (stored && token) {
+      onLogin(JSON.parse(stored));
+    }
+  }, []);
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "linear-gradient(135deg, #0a0f1e 0%, #0d1a0d 50%, #0a1525 100%)",
+      display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+      fontFamily: "'Segoe UI', sans-serif", position: "relative", overflow: "hidden",
+    }}>
+      {/* Background grid */}
+      <div style={{
+        position: "absolute", inset: 0, opacity: 0.04,
+        backgroundImage: "linear-gradient(#f59e0b 1px, transparent 1px), linear-gradient(90deg, #f59e0b 1px, transparent 1px)",
+        backgroundSize: "60px 60px",
+      }} />
+
+      {/* Glow */}
+      <div style={{
+        position: "absolute", width: 400, height: 400, borderRadius: "50%",
+        background: "radial-gradient(circle, rgba(245,158,11,0.08) 0%, transparent 70%)",
+        top: "50%", left: "50%", transform: "translate(-50%, -50%)",
+      }} />
+
+      <div style={{
+        position: "relative", textAlign: "center", padding: 48,
+        background: "rgba(13,20,37,0.8)", border: "1px solid rgba(245,158,11,0.15)",
+        borderRadius: 16, backdropFilter: "blur(20px)", maxWidth: 400, width: "90%",
+      }}>
+        {/* Logo */}
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 48, lineHeight: 1 }}>☀</div>
+        </div>
+        <div style={{ color: "#f59e0b", fontSize: 24, fontWeight: 700, letterSpacing: 6, marginBottom: 4 }}>
+          SOLARPORT
+        </div>
+        <div style={{ color: "#374151", fontSize: 11, letterSpacing: 3, marginBottom: 40 }}>
+          DCSI TEAM PORTAL
+        </div>
+
+        {loading ? (
+          <div style={{ color: "#6b7280", fontSize: 13 }}>Verifying your account…</div>
+        ) : (
+          <>
+            {error && (
+              <div style={{
+                background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)",
+                borderRadius: 8, padding: "10px 16px", marginBottom: 20,
+                color: "#ef4444", fontSize: 12,
+              }}>{error}</div>
+            )}
+
+            <button
+              onClick={() => { window.location.href = msAuth.getLoginUrl(); }}
+              style={{
+                width: "100%", padding: "14px 24px", borderRadius: 8,
+                background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)",
+                color: "#e5e7eb", fontSize: 14, cursor: "pointer",
+                display: "flex", alignItems: "center", justifyContent: "center", gap: 12,
+                transition: "all 0.2s", fontFamily: "'Segoe UI', sans-serif",
+              }}
+              onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.1)"}
+              onMouseLeave={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
+            >
+              <Icon name="ms" size={20} />
+              Sign in with Microsoft
+            </button>
+
+            <div style={{ color: "#1f2937", fontSize: 11, marginTop: 20, letterSpacing: 1 }}>
+              dcsi.ie accounts only
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── MAIN APP SHELL ───────────────────────────────────────────────────────────
+export default function SolarportApp() {
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState("dashboard"); // dashboard | admin
+  const [data, setData] = useState({ prices: [], customers: [], configurator: DEFAULTS.configurator, settings: DEFAULTS.settings });
+  const [loading, setLoading] = useState(true);
+  const [saved, setSaved] = useState(false);
+  const [adminTab, setAdminTab] = useState("prices");
+
+  const isPlaceholder = CONFIG.SUPABASE_URL === "YOUR_SUPABASE_URL";
+
+  useEffect(() => {
+    if (!user) return;
+    if (isPlaceholder) {
+      setData({
+        prices: DEFAULTS.prices,
+        customers: DEFAULTS.customers,
+        configurator: DEFAULTS.configurator,
+        settings: DEFAULTS.settings,
+      });
+      setLoading(false);
+      return;
+    }
+    loadData();
+  }, [user]);
+
+  const loadData = async () => {
+    setLoading(true);
+    try {
+      const [prices, customers, configurator, settings] = await Promise.all([
+        supabase.get("prices"),
+        supabase.get("customers"),
+        supabase.getConfig("configurator"),
+        supabase.getConfig("settings"),
+      ]);
+      setData({
+        prices: prices.length ? prices : DEFAULTS.prices,
+        customers: customers.length ? customers : DEFAULTS.customers,
+        configurator: configurator || DEFAULTS.configurator,
+        settings: settings || DEFAULTS.settings,
+      });
+    } catch (e) {
+      console.error("Failed to load from Supabase:", e);
+      setData({ prices: DEFAULTS.prices, customers: DEFAULTS.customers, configurator: DEFAULTS.configurator, settings: DEFAULTS.settings });
+    }
+    setLoading(false);
+  };
+
+  const saveAll = async () => {
+    if (isPlaceholder) { setSaved(true); setTimeout(() => setSaved(false), 2000); return; }
+    try {
+      await Promise.all([
+        supabase.upsert("prices", data.prices),
+        supabase.upsert("customers", data.customers),
+        supabase.setConfig("configurator", data.configurator),
+        supabase.setConfig("settings", data.settings),
+      ]);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      alert("Save failed: " + e.message);
+    }
+  };
+
+  const logout = () => {
+    sessionStorage.removeItem("sp_user");
+    sessionStorage.removeItem("sp_token");
+    setUser(null);
+  };
+
+  if (!user) return <LoginScreen onLogin={setUser} />;
+
+  const s = {
+    shell: { minHeight: "100vh", background: "#090e1c", fontFamily: "'Segoe UI', sans-serif", color: "#e5e7eb" },
+    header: {
+      background: "rgba(13,20,37,0.95)", borderBottom: "1px solid #1a2235",
+      padding: "0 24px", display: "flex", alignItems: "center", height: 56,
+      justifyContent: "space-between", backdropFilter: "blur(10px)",
+      position: "sticky", top: 0, zIndex: 100,
+    },
+    logo: { color: "#f59e0b", fontWeight: 700, letterSpacing: 4, fontSize: 15, display: "flex", alignItems: "center", gap: 10 },
+    nav: { display: "flex", gap: 4, height: "100%", alignItems: "center" },
+    navBtn: (active) => ({
+      padding: "6px 16px", background: active ? "rgba(245,158,11,0.12)" : "transparent",
+      border: active ? "1px solid rgba(245,158,11,0.3)" : "1px solid transparent",
+      borderRadius: 6, cursor: "pointer", color: active ? "#f59e0b" : "#6b7280",
+      fontSize: 12, letterSpacing: 1, fontFamily: "'Segoe UI', sans-serif",
+      display: "flex", alignItems: "center", gap: 6, transition: "all 0.15s",
+    }),
+    content: { padding: 28, maxWidth: 960, margin: "0 auto" },
+    card: { background: "#0d1425", border: "1px solid #1a2235", borderRadius: 10, padding: 20, marginBottom: 14 },
+    label: { fontSize: 10, color: "#4b5563", letterSpacing: 2, marginBottom: 6, display: "block", textTransform: "uppercase" },
+    input: {
+      background: "#090e1c", border: "1px solid #1a2235", borderRadius: 6,
+      color: "#e5e7eb", padding: "8px 12px", fontSize: 13, width: "100%",
+      fontFamily: "'Segoe UI', sans-serif", outline: "none", boxSizing: "border-box",
+    },
+    row: { display: "flex", gap: 10, alignItems: "center", marginBottom: 8 },
+    btn: (v = "default") => ({
+      padding: "7px 14px", borderRadius: 6, border: "none", cursor: "pointer", fontSize: 11,
+      letterSpacing: 1, fontFamily: "'Segoe UI', sans-serif", display: "flex", alignItems: "center", gap: 6,
+      background: v === "primary" ? "#f59e0b" : v === "danger" ? "rgba(239,68,68,0.1)" : "#1a2235",
+      color: v === "primary" ? "#090e1c" : v === "danger" ? "#ef4444" : "#9ca3af",
+      fontWeight: v === "primary" ? 700 : 400,
+      border: v === "danger" ? "1px solid rgba(239,68,68,0.2)" : "none",
+    }),
+    sectionTitle: { fontSize: 10, color: "#4b5563", letterSpacing: 3, marginBottom: 18, textTransform: "uppercase" },
+    pill: (color) => ({
+      fontSize: 10, padding: "2px 10px", borderRadius: 20,
+      border: `1px solid ${color}`, color, letterSpacing: 1,
+    }),
+  };
+
+  const tabs = user.isAdmin
+    ? [{ id: "dashboard", label: "Dashboard", icon: "sun" }, { id: "admin", label: "Admin Centre", icon: "shield" }]
+    : [{ id: "dashboard", label: "Dashboard", icon: "sun" }];
+
+  return (
+    <div style={s.shell}>
+      {isPlaceholder && (
+        <div style={{ background: "rgba(245,158,11,0.1)", borderBottom: "1px solid rgba(245,158,11,0.2)", padding: "8px 24px", textAlign: "center", fontSize: 11, color: "#f59e0b", letterSpacing: 1 }}>
+          ⚠ DEMO MODE — Azure AD & Supabase not yet configured. Data is not saved to cloud.
+        </div>
+      )}
+      <div style={s.header}>
+        <div style={s.logo}>
+          <span>☀</span> SOLARPORT
+        </div>
+        <div style={s.nav}>
+          {tabs.map(t => (
+            <button key={t.id} style={s.navBtn(view === t.id)} onClick={() => setView(t.id)}>
+              <Icon name={t.icon} size={12} /> {t.label}
+              {t.id === "admin" && <span style={{ ...s.pill("#f59e0b"), fontSize: 9, padding: "1px 6px" }}>ADMIN</span>}
+            </button>
+          ))}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <span style={{ fontSize: 12, color: "#374151" }}>{user.name}</span>
+          <button onClick={logout} style={s.btn()}>
+            <Icon name="logout" size={12} /> Sign out
+          </button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div style={{ textAlign: "center", padding: 80, color: "#374151", fontSize: 13 }}>Loading data…</div>
+      ) : view === "dashboard" ? (
+        <Dashboard data={data} user={user} s={s} />
+      ) : (
+        <AdminCentre data={data} setData={setData} saveAll={saveAll} saved={saved} s={s} adminTab={adminTab} setAdminTab={setAdminTab} />
+      )}
+    </div>
+  );
+}
+
+// ─── DASHBOARD (Team View) ────────────────────────────────────────────────────
+function Dashboard({ data, user, s }) {
+  const { prices, customers, configurator, settings } = data;
+  const tierColor = { Standard: "#6b7280", Premium: "#f59e0b", Enterprise: "#3b82f6" };
+  const categories = [...new Set(prices.map(p => p.category))];
+
+  return (
+    <div style={s.content}>
+      {/* Welcome */}
+      <div style={{ marginBottom: 28 }}>
+        <div style={{ fontSize: 22, fontWeight: 300, color: "#e5e7eb", marginBottom: 4 }}>
+          Good day, <span style={{ color: "#f59e0b", fontWeight: 600 }}>{user.name.split(" ")[0]}</span>
+        </div>
+        <div style={{ fontSize: 12, color: "#374151" }}>{settings.companyName} · {new Date().toLocaleDateString("en-IE", { weekday: "long", day: "numeric", month: "long" })}</div>
+      </div>
+
+      {/* Stats */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: 24 }}>
+        {[
+          { label: "Price Lines", value: prices.length, color: "#f59e0b" },
+          { label: "Customers", value: customers.length, color: "#3b82f6" },
+          { label: "Default Margin", value: `${settings.defaultMargin}%`, color: "#10b981" },
+        ].map(stat => (
+          <div key={stat.label} style={{ ...s.card, textAlign: "center", padding: 24 }}>
+            <div style={{ fontSize: 32, fontWeight: 700, color: stat.color, marginBottom: 4 }}>{stat.value}</div>
+            <div style={{ fontSize: 10, color: "#4b5563", letterSpacing: 2 }}>{stat.label.toUpperCase()}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Price List */}
+      <div style={s.card}>
+        <div style={s.sectionTitle}>Current Price List</div>
+        {categories.map(cat => (
+          <div key={cat} style={{ marginBottom: 20 }}>
+            <div style={{ fontSize: 10, color: "#f59e0b", letterSpacing: 2, marginBottom: 10 }}>{cat.toUpperCase()}</div>
+            {prices.filter(p => p.category === cat).map(p => (
+              <div key={p.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid #1a2235" }}>
+                <div>
+                  <span style={{ fontSize: 13 }}>{p.name}</span>
+                  <span style={{ marginLeft: 10, fontSize: 10, color: "#374151" }}>{p.sku}</span>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ color: "#f59e0b", fontWeight: 600 }}>€{p.price.toLocaleString()}</div>
+                  <div style={{ fontSize: 10, color: "#374151" }}>{p.unit}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+        <div style={{ fontSize: 10, color: "#374151", marginTop: 8 }}>
+          VAT @ {settings.vatRate}% · {settings.footerNote}
+        </div>
+      </div>
+
+      {/* Configurator Quick Reference */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+        <div style={s.card}>
+          <div style={s.sectionTitle}>Panel Options</div>
+          {configurator.panelOptions.map((o, i) => <div key={i} style={{ padding: "5px 0", fontSize: 12, borderBottom: "1px solid #1a2235", color: "#9ca3af" }}>{o}</div>)}
+        </div>
+        <div style={s.card}>
+          <div style={s.sectionTitle}>Charger Types</div>
+          {configurator.chargerTypes.map((o, i) => <div key={i} style={{ padding: "5px 0", fontSize: 12, borderBottom: "1px solid #1a2235", color: "#9ca3af" }}>{o}</div>)}
+        </div>
+      </div>
+
+      {/* Customer List */}
+      <div style={s.card}>
+        <div style={s.sectionTitle}>Customer Directory</div>
+        {customers.map(c => (
+          <div key={c.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: "1px solid #1a2235" }}>
+            <div>
+              <div style={{ fontSize: 13 }}>{c.name}</div>
+              <div style={{ fontSize: 11, color: "#374151", marginTop: 2 }}>{c.email} · {c.phone}</div>
+            </div>
+            <span style={s.pill(tierColor[c.tier] || "#6b7280")}>{c.tier}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── ADMIN CENTRE ─────────────────────────────────────────────────────────────
+function AdminCentre({ data, setData, saveAll, saved, s, adminTab, setAdminTab }) {
+  const tabs = [
+    { id: "prices", label: "Prices", icon: "price" },
+    { id: "customers", label: "Customers", icon: "users" },
+    { id: "configurator", label: "Configurator", icon: "solar" },
+    { id: "settings", label: "Settings", icon: "settings" },
+  ];
+
+  const update = (key, val) => setData(d => ({ ...d, [key]: val }));
+
+  return (
+    <div>
+      {/* Admin sub-nav */}
+      <div style={{ background: "#0d1425", borderBottom: "1px solid #1a2235", padding: "0 28px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ display: "flex" }}>
+          {tabs.map(t => (
+            <button key={t.id} style={{
+              padding: "12px 18px", background: "none", border: "none", cursor: "pointer",
+              color: adminTab === t.id ? "#f59e0b" : "#4b5563",
+              borderBottom: adminTab === t.id ? "2px solid #f59e0b" : "2px solid transparent",
+              fontSize: 11, letterSpacing: 1, fontFamily: "'Segoe UI', sans-serif",
+              display: "flex", alignItems: "center", gap: 6,
+            }} onClick={() => setAdminTab(t.id)}>
+              <Icon name={t.icon} size={12} /> {t.label}
+            </button>
+          ))}
+        </div>
+        <button onClick={saveAll} style={s.btn("primary")}>
+          <Icon name="save" size={12} /> {saved ? "SAVED ✓" : "SAVE ALL"}
+        </button>
+      </div>
+
+      <div style={s.content}>
+        {adminTab === "prices" && <PricesTab prices={data.prices} setPrices={v => update("prices", v)} s={s} />}
+        {adminTab === "customers" && <CustomersTab customers={data.customers} setCustomers={v => update("customers", v)} s={s} />}
+        {adminTab === "configurator" && <ConfiguratorTab config={data.configurator} setConfig={v => update("configurator", v)} s={s} />}
+        {adminTab === "settings" && <SettingsTab settings={data.settings} setSettings={v => update("settings", v)} s={s} />}
+      </div>
+    </div>
+  );
+}
+
+// ─── PRICES TAB ───────────────────────────────────────────────────────────────
+function PricesTab({ prices, setPrices, s }) {
+  const [editing, setEditing] = useState(null);
+  const categories = [...new Set(prices.map(p => p.category))];
+  const update = (id, f, v) => setPrices(ps => ps.map(p => p.id === id ? { ...p, [f]: v } : p));
+  const remove = (id) => setPrices(ps => ps.filter(p => p.id !== id));
+  const add = () => setPrices(ps => [...ps, { id: Date.now(), name: "New Item", sku: "SKU-NEW", price: 0, unit: "per unit", category: "Hardware" }]);
+
+  return (
+    <div>
+      <div style={s.sectionTitle}>Price List Management</div>
+      {categories.map(cat => (
+        <div key={cat} style={s.card}>
+          <div style={{ fontSize: 10, color: "#f59e0b", letterSpacing: 2, marginBottom: 12 }}>{cat.toUpperCase()}</div>
+          {prices.filter(p => p.category === cat).map(p => (
+            <div key={p.id} style={{ padding: "8px", borderRadius: 6, background: editing === p.id ? "#090e1c" : "transparent", marginBottom: 6 }}>
+              {editing === p.id ? (
+                <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr auto", gap: 8, alignItems: "center" }}>
+                  <input style={s.input} value={p.name} onChange={e => update(p.id, "name", e.target.value)} placeholder="Name" />
+                  <input style={s.input} value={p.sku} onChange={e => update(p.id, "sku", e.target.value)} placeholder="SKU" />
+                  <input type="number" style={s.input} value={p.price} onChange={e => update(p.id, "price", parseFloat(e.target.value))} />
+                  <input style={s.input} value={p.unit} onChange={e => update(p.id, "unit", e.target.value)} />
+                  <button style={s.btn("primary")} onClick={() => setEditing(null)}>DONE</button>
+                </div>
+              ) : (
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <span style={{ flex: 2, fontSize: 13 }}>{p.name}</span>
+                  <span style={{ flex: 1, color: "#4b5563", fontSize: 11 }}>{p.sku}</span>
+                  <span style={{ flex: 1, color: "#f59e0b", fontWeight: 600 }}>€{p.price.toLocaleString()}</span>
+                  <span style={{ flex: 1, color: "#374151", fontSize: 11 }}>{p.unit}</span>
+                  <button style={s.btn()} onClick={() => setEditing(p.id)}><Icon name="edit" size={12} /></button>
+                  <button style={s.btn("danger")} onClick={() => remove(p.id)}><Icon name="trash" size={12} /></button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      ))}
+      <button style={s.btn("primary")} onClick={add}><Icon name="plus" size={12} /> ADD ITEM</button>
+    </div>
+  );
+}
+
+// ─── CUSTOMERS TAB ────────────────────────────────────────────────────────────
+function CustomersTab({ customers, setCustomers, s }) {
+  const [editing, setEditing] = useState(null);
+  const tierColor = { Standard: "#6b7280", Premium: "#f59e0b", Enterprise: "#3b82f6" };
+  const update = (id, f, v) => setCustomers(cs => cs.map(c => c.id === id ? { ...c, [f]: v } : c));
+  const remove = (id) => setCustomers(cs => cs.filter(c => c.id !== id));
+  const add = () => setCustomers(cs => [...cs, { id: Date.now(), name: "", email: "", phone: "", tier: "Standard", notes: "" }]);
+
+  return (
+    <div>
+      <div style={s.sectionTitle}>Customer Records</div>
+      {customers.map(c => (
+        <div key={c.id} style={{ ...s.card, borderLeft: `3px solid ${tierColor[c.tier] || "#374151"}` }}>
+          {editing === c.id ? (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <div><label style={s.label}>Company Name</label><input style={s.input} value={c.name} onChange={e => update(c.id, "name", e.target.value)} /></div>
+              <div><label style={s.label}>Email</label><input style={s.input} value={c.email} onChange={e => update(c.id, "email", e.target.value)} /></div>
+              <div><label style={s.label}>Phone</label><input style={s.input} value={c.phone} onChange={e => update(c.id, "phone", e.target.value)} /></div>
+              <div><label style={s.label}>Tier</label>
+                <select style={s.input} value={c.tier} onChange={e => update(c.id, "tier", e.target.value)}>
+                  {["Standard", "Premium", "Enterprise"].map(t => <option key={t}>{t}</option>)}
+                </select>
+              </div>
+              <div style={{ gridColumn: "1/-1" }}><label style={s.label}>Notes</label><input style={s.input} value={c.notes} onChange={e => update(c.id, "notes", e.target.value)} /></div>
+              <div style={{ gridColumn: "1/-1", display: "flex", gap: 8 }}>
+                <button style={s.btn("primary")} onClick={() => setEditing(null)}>SAVE</button>
+                <button style={s.btn("danger")} onClick={() => { remove(c.id); setEditing(null); }}><Icon name="trash" size={12} /> DELETE</button>
+              </div>
+            </div>
+          ) : (
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <div style={{ fontSize: 14 }}>{c.name || "—"}</div>
+                <div style={{ fontSize: 11, color: "#374151", marginTop: 3 }}>{c.email} · {c.phone}</div>
+                {c.notes && <div style={{ fontSize: 11, color: "#4b5563", marginTop: 2 }}>{c.notes}</div>}
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ ...s.pill(tierColor[c.tier] || "#6b7280"), fontSize: 10 }}>{c.tier}</span>
+                <button style={s.btn()} onClick={() => setEditing(c.id)}><Icon name="edit" size={12} /></button>
+              </div>
+            </div>
+          )}
+        </div>
+      ))}
+      <button style={s.btn("primary")} onClick={add}><Icon name="plus" size={12} /> ADD CUSTOMER</button>
+    </div>
+  );
+}
+
+// ─── CONFIGURATOR TAB ─────────────────────────────────────────────────────────
+function ConfiguratorTab({ config, setConfig, s }) {
+  const updateList = (key, idx, val) => setConfig(c => ({ ...c, [key]: c[key].map((v, i) => i === idx ? val : v) }));
+  const removeFromList = (key, idx) => setConfig(c => ({ ...c, [key]: c[key].filter((_, i) => i !== idx) }));
+  const addToList = (key) => setConfig(c => ({ ...c, [key]: [...c[key], "New Option"] }));
+  const updateVal = (key, val) => setConfig(c => ({ ...c, [key]: val }));
+
+  const lists = [
+    { key: "panelOptions", label: "Solar Panel Options" },
+    { key: "batteryOptions", label: "Battery Options" },
+    { key: "chargerTypes", label: "Charger Types" },
+    { key: "roofTypes", label: "Installation Types" },
+    { key: "warrantyYears", label: "Warranty Options" },
+  ];
+
+  return (
+    <div>
+      <div style={s.sectionTitle}>Configurator Options</div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+        <div style={s.card}>
+          <label style={s.label}>Max Panels Per Port</label>
+          <input type="number" style={s.input} value={config.maxPanelsPerPort} onChange={e => updateVal("maxPanelsPerPort", parseInt(e.target.value))} />
+        </div>
+        <div style={s.card}>
+          <label style={s.label}>Default Margin (%)</label>
+          <input type="number" style={s.input} value={config.defaultMargin} onChange={e => updateVal("defaultMargin", parseFloat(e.target.value))} />
+        </div>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        {lists.map(({ key, label }) => (
+          <div key={key} style={s.card}>
+            <div style={{ fontSize: 10, color: "#f59e0b", letterSpacing: 2, marginBottom: 12 }}>{label.toUpperCase()}</div>
+            {config[key].map((val, i) => (
+              <div key={i} style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                <input style={{ ...s.input, flex: 1 }} value={val} onChange={e => updateList(key, i, e.target.value)} />
+                <button style={s.btn("danger")} onClick={() => removeFromList(key, i)}><Icon name="trash" size={12} /></button>
+              </div>
+            ))}
+            <button style={{ ...s.btn(), fontSize: 10 }} onClick={() => addToList(key)}><Icon name="plus" size={11} /> ADD</button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── SETTINGS TAB ─────────────────────────────────────────────────────────────
+function SettingsTab({ settings, setSettings, s }) {
+  const update = (key, val) => setSettings(st => ({ ...st, [key]: val }));
+
+  return (
+    <div>
+      <div style={s.sectionTitle}>System Settings</div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        {[
+          { key: "companyName", label: "Company Name", type: "text" },
+          { key: "currency", label: "Currency", type: "select", opts: ["EUR", "GBP", "USD"] },
+          { key: "vatRate", label: "VAT Rate (%)", type: "number" },
+          { key: "defaultMargin", label: "Default Margin (%)", type: "number" },
+          { key: "quoteValidDays", label: "Quote Valid (Days)", type: "number" },
+          { key: "footerNote", label: "Quote Footer Note", type: "text" },
+        ].map(({ key, label, type, opts }) => (
+          <div key={key} style={s.card}>
+            <label style={s.label}>{label}</label>
+            {type === "select" ? (
+              <select style={s.input} value={settings[key]} onChange={e => update(key, e.target.value)}>
+                {opts.map(o => <option key={o}>{o}</option>)}
+              </select>
+            ) : (
+              <input type={type} style={s.input} value={settings[key]} onChange={e => update(key, type === "number" ? parseFloat(e.target.value) : e.target.value)} />
+            )}
+          </div>
+        ))}
+      </div>
+
+      {/* Azure/Supabase config reminder */}
+      <div style={{ ...s.card, marginTop: 24, borderColor: "rgba(245,158,11,0.2)", background: "rgba(245,158,11,0.04)" }}>
+        <div style={{ fontSize: 10, color: "#f59e0b", letterSpacing: 2, marginBottom: 12 }}>INTEGRATION CONFIG</div>
+        <div style={{ fontSize: 12, color: "#6b7280", lineHeight: 1.8 }}>
+          <div>Admin email: <span style={{ color: "#e5e7eb" }}>{CONFIG.ADMIN_EMAIL}</span></div>
+          <div>Azure Client ID: <span style={{ color: CONFIG.AZURE_CLIENT_ID.startsWith("YOUR") ? "#ef4444" : "#10b981" }}>{CONFIG.AZURE_CLIENT_ID.startsWith("YOUR") ? "⚠ Not configured" : "✓ Configured"}</span></div>
+          <div>Supabase: <span style={{ color: CONFIG.SUPABASE_URL.startsWith("YOUR") ? "#ef4444" : "#10b981" }}>{CONFIG.SUPABASE_URL.startsWith("YOUR") ? "⚠ Not configured" : "✓ Configured"}</span></div>
+        </div>
+      </div>
+    </div>
+  );
+}
