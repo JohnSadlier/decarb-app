@@ -16,10 +16,10 @@ import { useState, useEffect, useCallback } from "react";
 // ─── CONFIG ──────────────────────────────────────────────────────────────────
 const CONFIG = {
   ADMIN_EMAIL: "john.sadlier@dcsi.ie",
-  AZURE_CLIENT_ID: https://zxntnmppktkulrgtefjj.supabase.co,    // ← Replace after Azure setup
-  AZURE_TENANT_ID: sb_publishable_aeVrpEZuGL5qAlc0KHxk_A_V5QSZOkS,         // ← Replace after Azure setup
-  SUPABASE_URL: 3698130c-bc4c-4dbb-ad46-26f346a7ee62,                // ← Replace after Supabase setup
-  SUPABASE_ANON_KEY: a4b2eca8-2047-48cb-87da-8d07b5d559cb,      // ← Replace after Supabase setup
+  AZURE_CLIENT_ID: "https://zxntnmppktkulrgtefjj.supabase.co",    // ← Replace after Azure setup
+  AZURE_TENANT_ID: "sb_publishable_aeVrpEZuGL5qAlc0KHxk_A_V5QSZOkS",         // ← Replace after Azure setup
+  SUPABASE_URL: "3698130c-bc4c-4dbb-ad46-26f346a7ee62",                // ← Replace after Supabase setup
+  SUPABASE_ANON_KEY: "a4b2eca8-2047-48cb-87da-8d07b5d559cb",      // ← Replace after Supabase setup
 };
 
 // ─── SUPABASE CLIENT ──────────────────────────────────────────────────────────
